@@ -3,14 +3,13 @@
     <!-- No launcher icon needed, just xposed stuff -->
     <application
         android:label="Tanke LSPosed Hook"
-        android:hasCode="true"
-        android:extractNativeLibs="false">
+        android:hasCode="true">
         <meta-data
             android:name="xposedmodule"
             android:value="true" />
         <meta-data
             android:name="xposeddescription"
-            android:value="Hooks clone for com.lptiyu.tanke" />
+            android:value="Hooks and bypasses anti-hook detection for com.lptiyu.tanke" />
         <meta-data
             android:name="xposedminversion"
             android:value="93" />
