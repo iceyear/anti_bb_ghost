@@ -1,25 +1,22 @@
 /*
  * SIGSEGV signal handler for anti-hook detection bypass.
  *
- * Background:
- *   The packer (BangBang/梆梆) detects Xposed by checking stack traces from native
- *   code. When Xposed is detected, the packer deliberately crashes with a null-pointer
- *   dereference (fault addr 0x88c = NULL + struct field offset).
+ * The packer detects Xposed, then deliberately crashes with corrupted registers:
+ *   PC=0x88c, LR=0, SP=0 — making normal recovery impossible.
  *
  * Strategy:
- *   Install a process-wide SIGSEGV handler. When the fault address falls within the
- *   null page (< 0x1000), simulate a function return by setting PC to the link register
- *   (LR / X30) and X0 to 0. This makes the crashing function return immediately with
- *   null, allowing the caller to handle the "error" gracefully instead of killing the
- *   process.
- *
- *   For all other SIGSEGV (non-null-page), chain to the previous handler.
+ *   For recoverable crashes (valid LR/SP): simulate function return.
+ *   For unrecoverable crashes (LR=0, SP=0): terminate ONLY the detection thread
+ *   using syscall(SYS_exit, 0), which exits just the calling thread without
+ *   killing the whole process. The main app thread survives.
  */
 
 #include <jni.h>
 #include <signal.h>
 #include <string.h>
 #include <stdint.h>
+#include <unistd.h>
+#include <sys/syscall.h>
 #include <android/log.h>
 
 #if defined(__aarch64__)
@@ -30,7 +27,6 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  TAG, __VA_ARGS__)
 
-/* Previous handler, so we can chain for non-ghost crashes */
 static struct sigaction old_sa;
 static volatile int handler_installed = 0;
 
@@ -45,7 +41,6 @@ static void chain_old_handler(int sig, siginfo_t *info, void *ucontext) {
         old_sa.sa_handler(sig);
         return;
     }
-    /* No previous handler — restore default and re-raise */
     signal(SIGSEGV, SIG_DFL);
     raise(SIGSEGV);
 }
@@ -53,11 +48,7 @@ static void chain_old_handler(int sig, siginfo_t *info, void *ucontext) {
 static void sigsegv_handler(int sig, siginfo_t *info, void *ucontext) {
     uintptr_t fault_addr = (uintptr_t)info->si_addr;
 
-    /*
-     * Only intercept null-page accesses (address < 4 KB).
-     * These are null-pointer dereferences with a struct field offset —
-     * exactly the crash pattern from packer's deliberate kill mechanism.
-     */
+    /* Only intercept null-page crashes (< 4KB) */
     if (fault_addr >= 0x1000) {
         chain_old_handler(sig, info, ucontext);
         return;
@@ -65,24 +56,36 @@ static void sigsegv_handler(int sig, siginfo_t *info, void *ucontext) {
 
 #if defined(__aarch64__)
     ucontext_t *ctx = (ucontext_t *)ucontext;
-    uint64_t lr = ctx->uc_mcontext.regs[30]; /* X30 = Link Register */
-    uint64_t old_pc = ctx->uc_mcontext.pc;
+    uint64_t lr  = ctx->uc_mcontext.regs[30];
+    uint64_t sp  = ctx->uc_mcontext.sp;
+    uint64_t pc  = ctx->uc_mcontext.pc;
 
-    if (lr == 0 || lr < 0x1000) {
-        /* LR is invalid (null or in null page) — can't safely return. */
-        LOGW("Cannot recover: LR=0x%lx, chaining to old handler", (unsigned long)lr);
-        chain_old_handler(sig, info, ucontext);
+    /*
+     * Case 1: Recoverable — LR and SP are valid.
+     * Simulate function return: PC = LR, X0 = 0 (return null).
+     */
+    if (lr > 0x1000 && sp > 0x1000) {
+        ctx->uc_mcontext.pc = lr;
+        ctx->uc_mcontext.regs[0] = 0;
+        LOGI("Recovered SIGSEGV at 0x%lx (PC=0x%lx → LR=0x%lx)",
+             (unsigned long)fault_addr, (unsigned long)pc, (unsigned long)lr);
         return;
     }
 
-    /* Simulate function return: set PC to LR, return 0 in X0 */
-    ctx->uc_mcontext.pc = lr;
-    ctx->uc_mcontext.regs[0] = 0;  /* Return null / 0 */
-
-    LOGI("Recovered SIGSEGV at 0x%lx (PC was 0x%lx, returning to LR=0x%lx)",
-         (unsigned long)fault_addr, (unsigned long)old_pc, (unsigned long)lr);
+    /*
+     * Case 2: Unrecoverable — LR and/or SP are zeroed (deliberate kill).
+     * The packer detected hooks and corrupted all registers before crashing.
+     * We can't return anywhere, but we CAN kill just this thread.
+     *
+     * syscall(__NR_exit, 0) terminates ONLY the calling thread (not the process).
+     * The signal handler runs on an alternate signal stack (set up by bionic),
+     * so we have a valid stack even though user SP is 0.
+     */
+    LOGI("Deliberate crash detected at 0x%lx (PC=0x%lx LR=0x%lx SP=0x%lx) — killing thread only",
+         (unsigned long)fault_addr, (unsigned long)pc, (unsigned long)lr, (unsigned long)sp);
+    syscall(__NR_exit, 0);
+    /* NOT REACHED */
 #else
-    /* Non-ARM64: can't safely recover */
     chain_old_handler(sig, info, ucontext);
 #endif
 }
@@ -94,7 +97,7 @@ Java_com_lptiyu_tanke_hook_NativeHelper_nativeInstallHandler(JNIEnv *env, jclass
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = sigsegv_handler;
-    sa.sa_flags     = SA_SIGINFO;
+    sa.sa_flags     = SA_SIGINFO | SA_ONSTACK;  /* Use alternate signal stack */
     sigemptyset(&sa.sa_mask);
 
     if (sigaction(SIGSEGV, &sa, &old_sa) == 0) {
