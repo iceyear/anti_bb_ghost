@@ -4,7 +4,7 @@
     <application
         android:label="Tanke LSPosed Hook"
         android:hasCode="true"
-        android:extractNativeLibs="true">
+        android:extractNativeLibs="false">
         <meta-data
             android:name="xposedmodule"
             android:value="true" />
