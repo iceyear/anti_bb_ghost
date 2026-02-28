@@ -1,5 +1,6 @@
 package com.lptiyu.tanke.hook
 
+import android.content.pm.ApplicationInfo
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.IXposedHookZygoteInit
 import de.robv.android.xposed.XC_MethodHook
@@ -10,51 +11,12 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam
 class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
     companion object {
-        private val suspiciousKeywords = arrayOf(
-            "org.lsposed",
-            "de.robv.android.xposed",
-            "LSPHooker",
-            "com.elder.xposed",
-            "HookBridge",
-            "SandHook",
-            "EdXposed",
-            "me.weishu.epic",
-            "top.canyie.pine",
-            "com.swift.sandhook",
-            "J.callback" // Obfuscated LSPosed callback
-        )
-
         private var isBypassed = false
 
-        /**
-         * 洗白堆栈，将框架的痕迹抹去
-         */
-        private fun scrubStackTrace(throwable: Throwable?) {
-            var cause = throwable
-            while (cause != null) {
-                val originalTrace = cause.stackTrace
-                if (originalTrace != null) {
-                    val cleanTrace = originalTrace.filter { element ->
-                        val className = element.className
-                        val methodName = element.methodName
-                        // 如果栈帧包含可疑关键字，则剔除
-                        suspiciousKeywords.none { keyword ->
-                            className.contains(keyword) || methodName.contains(keyword)
-                        }
-                    }.toTypedArray()
-
-                    if (cleanTrace.size != originalTrace.size) {
-                        cause.stackTrace = cleanTrace
-                    }
-                }
-                cause = cause.cause
-            }
-        }
-
-        private fun bypassStackTraceDetection() {
+        private fun bypassGhostInstanceDetection() {
             if (isBypassed) return
             isBypassed = true
-            XposedBridge.log("TankeHook: Initializing Ghost Instance detection bypass globally...")
+            XposedBridge.log("TankeHook: Initializing Ghost Instance & AppComponentFactory trap bypass...")
 
             // Hook LoadedApk.createOrUpdateClassLoaderLocked
             try {
@@ -66,9 +28,44 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 )
 
                 XposedBridge.hookMethod(createClassLoaderMethod, object : XC_MethodHook() {
+                    @Throws(Throwable::class)
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val loadedApk = param.thisObject
+                        if (loadedApk == null) return
+
+                        // 1. Ghost Instance Prevention: If mApplicationInfo is null, it's an Unsafe allocated object.
+                        // We must immediately return to prevent NullPointerException and stack generation.
+                        val appInfo = XposedHelpers.getObjectField(loadedApk, "mApplicationInfo") as? ApplicationInfo
+                        if (appInfo == null) {
+                            XposedBridge.log("TankeHook: Detected Ghost LoadedApk instance! Intercepting crash.")
+                            param.result = null
+                            return
+                        }
+
+                        // 2. AppComponentFactory Trap Prevention:
+                        // The shell sets appComponentFactory to a nonexistent class (e.g. "com.lptiyu.tanke.lp")
+                        // so that LoadedApk.createAppFactory() throws a ClassNotFoundException, which logs the hook stack trace.
+                        // We temporarily clear it before original method executes so it uses the default factory safely.
+                        val componentFactory = appInfo.appComponentFactory
+                        if (componentFactory != null && (componentFactory == "com.lptiyu.tanke.lp" || componentFactory.contains("tanke"))) {
+                            XposedBridge.log("TankeHook: Detected trap appComponentFactory: $componentFactory. Nullifying to prevent ClassNotFoundException.")
+                            XposedHelpers.setObjectField(appInfo, "appComponentFactory", null)
+                            // We attach the original factory name to the param to restore it later if needed
+                            param.setObjectExtra("originalFactory", componentFactory)
+                        }
+                    }
+
+                    @Throws(Throwable::class)
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        if (param.hasThrowable()) {
-                            scrubStackTrace(param.throwable)
+                        // Restore the appComponentFactory just in case the app checks it later
+                        val originalFactory = param.getObjectExtra("originalFactory") as? String
+                        if (originalFactory != null) {
+                            val loadedApk = param.thisObject
+                            val appInfo = XposedHelpers.getObjectField(loadedApk, "mApplicationInfo") as? ApplicationInfo
+                            if (appInfo != null) {
+                                XposedHelpers.setObjectField(appInfo, "appComponentFactory", originalFactory)
+                                XposedBridge.log("TankeHook: Restored trap appComponentFactory: $originalFactory")
+                            }
                         }
                     }
                 })
@@ -76,56 +73,11 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
             } catch (e: Throwable) {
                 XposedBridge.log("TankeHook: Failed to hook LoadedApk: ${e.message}")
             }
-
-            // Hook ActivityThread.attach just in case they check it
-            try {
-                val activityThreadClass = XposedHelpers.findClass("android.app.ActivityThread", null)
-                val attachMethod = XposedHelpers.findMethodExact(
-                    activityThreadClass,
-                    "attach",
-                    Boolean::class.javaPrimitiveType,
-                    Long::class.javaPrimitiveType
-                )
-
-                XposedBridge.hookMethod(attachMethod, object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        if (param.hasThrowable()) {
-                            scrubStackTrace(param.throwable)
-                        }
-                    }
-                })
-                XposedBridge.log("TankeHook: Hooked ActivityThread.attach successfully")
-            } catch (e: Throwable) {
-                XposedBridge.log("TankeHook: Failed to hook ActivityThread: ${e.message}")
-            }
-
-            // Catch Throwable getStackTrace globally
-            try {
-                val getStackTraceMethod = Throwable::class.java.getDeclaredMethod("getStackTrace")
-                XposedBridge.hookMethod(getStackTraceMethod, object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        val elements = param.result as? Array<StackTraceElement> ?: return
-                        val cleanElements = elements.filter { element ->
-                            suspiciousKeywords.none { keyword ->
-                                element.className.contains(keyword) || element.methodName.contains(keyword)
-                            }
-                        }.toTypedArray()
-
-                        if (cleanElements.size != elements.size) {
-                            param.result = cleanElements
-                        }
-                    }
-                })
-                XposedBridge.log("TankeHook: Hooked Throwable.getStackTrace successfully")
-            } catch (e: Throwable) {
-                XposedBridge.log("TankeHook: Failed to hook Throwable.getStackTrace: ${e.message}")
-            }
         }
     }
 
     override fun initZygote(startupParam: IXposedHookZygoteInit.StartupParam) {
-        // Run early globally
-        bypassStackTraceDetection()
+        bypassGhostInstanceDetection()
     }
 
     override fun handleLoadPackage(lpparam: LoadPackageParam) {
