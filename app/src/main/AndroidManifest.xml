@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- No launcher icon needed, just xposed stuff -->
+    <application
+        android:label="Tanke LSPosed Hook"
+        android:hasCode="true"
+        android:extractNativeLibs="true">
+        <meta-data
+            android:name="xposedmodule"
+            android:value="true" />
+        <meta-data
+            android:name="xposeddescription"
+            android:value="Hooks clone for com.lptiyu.tanke" />
+        <meta-data
+            android:name="xposedminversion"
+            android:value="93" />
+        <meta-data
+            android:name="xposedscope"
+            android:value="com.lptiyu.tanke" />
+    </application>
+</manifest>
