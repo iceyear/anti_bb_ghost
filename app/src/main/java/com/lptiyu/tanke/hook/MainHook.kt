@@ -33,8 +33,7 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         val loadedApk = param.thisObject
                         if (loadedApk == null) return
 
-                        // 1. Ghost Instance Prevention: If mApplicationInfo is null, it's an Unsafe allocated object.
-                        // We must immediately return to prevent NullPointerException and stack generation.
+                        // 1. Ghost Instance Prevention
                         val appInfo = XposedHelpers.getObjectField(loadedApk, "mApplicationInfo") as? ApplicationInfo
                         if (appInfo == null) {
                             XposedBridge.log("TankeHook: Detected Ghost LoadedApk instance! Intercepting crash.")
@@ -42,22 +41,17 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                             return
                         }
 
-                        // 2. AppComponentFactory Trap Prevention:
-                        // The shell sets appComponentFactory to a nonexistent class (e.g. "com.lptiyu.tanke.lp")
-                        // so that LoadedApk.createAppFactory() throws a ClassNotFoundException, which logs the hook stack trace.
-                        // We temporarily clear it before original method executes so it uses the default factory safely.
+                        // 2. AppComponentFactory Trap Prevention
                         val componentFactory = appInfo.appComponentFactory
                         if (componentFactory != null && (componentFactory == "com.lptiyu.tanke.lp" || componentFactory.contains("tanke"))) {
                             XposedBridge.log("TankeHook: Detected trap appComponentFactory: $componentFactory. Nullifying to prevent ClassNotFoundException.")
                             XposedHelpers.setObjectField(appInfo, "appComponentFactory", null)
-                            // We attach the original factory name to the param to restore it later if needed
                             param.setObjectExtra("originalFactory", componentFactory)
                         }
                     }
 
                     @Throws(Throwable::class)
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        // Restore the appComponentFactory just in case the app checks it later
                         val originalFactory = param.getObjectExtra("originalFactory") as? String
                         if (originalFactory != null) {
                             val loadedApk = param.thisObject
@@ -85,18 +79,6 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
             return
         }
         XposedBridge.log("TankeHook: loading for ${lpparam.packageName}")
-
-        try {
-            System.loadLibrary("tanke-hook")
-            XposedBridge.log("TankeHook: successfully loaded libtanke-hook.so")
-        } catch (e: Throwable) {
-            XposedBridge.log("TankeHook: error loading library: ${e.message}")
-            try {
-                val appInfo = lpparam.appInfo
-                val libDir = appInfo.nativeLibraryDir
-                XposedBridge.log("TankeHook: appInfo nativeLibraryDir is $libDir")
-            } catch (e2: Throwable) {
-            }
-        }
+        // Native loading logic removed.
     }
 }
