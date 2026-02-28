@@ -34,7 +34,7 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
             var cause = throwable
             while (cause != null) {
                 val originalTrace = cause.stackTrace
-                if (originalTrace != null) {
+                if (originalTrace != null && originalTrace.isNotEmpty()) {
                     val cleanTrace = mutableListOf<StackTraceElement>()
                     var skipNextReflection = false
 
@@ -86,8 +86,8 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
                 XposedBridge.hookMethod(createClassLoaderMethod, object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        // 如果抛出了异常（比如 NullPointerException 由于幽灵对象导致）
-                        // 在壳捕获到之前，洗白它！
+                        // 如果方法内部抛出了异常（比如壳传入幽灵对象导致的 NPE）
+                        // 在异常返回给壳之前，对其堆栈进行深度清洗
                         if (param.hasThrowable()) {
                             scrubStackTrace(param.throwable)
                         }
@@ -120,29 +120,27 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 XposedBridge.log("TankeHook: Failed to hook ActivityThread: ${e.message}")
             }
 
-            // 3. Hook ClassLoader.loadClass to catch ClassNotFoundException immediately
-            // 这是为了捕获 appComponentFactory 被篡改时抛出的 ClassNotFoundException
-            try {
-                val classLoaderClass = ClassLoader::class.java
-                val loadClassMethod = classLoaderClass.getDeclaredMethod("loadClass", String::class.java)
-                XposedBridge.hookMethod(loadClassMethod, object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        if (param.hasThrowable()) {
-                            scrubStackTrace(param.throwable)
-                        }
-                    }
-                })
-                XposedBridge.log("TankeHook: Hooked ClassLoader.loadClass for stack scrubbing")
-            } catch (e: Throwable) {
-                XposedBridge.log("TankeHook: Failed to hook ClassLoader.loadClass: ${e.message}")
-            }
-
-            // 4. Hook Throwable.getStackTrace (兜底防护)
+            // 3. Hook Throwable.getStackTrace (兜底防护，如果壳主动调用 e.getStackTrace())
+            // 避免高频调用导致的性能问题，这里只对可疑对象起效，且内部不抛异常
             try {
                 val getStackTraceMethod = Throwable::class.java.getDeclaredMethod("getStackTrace")
                 XposedBridge.hookMethod(getStackTraceMethod, object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val elements = param.result as? Array<StackTraceElement> ?: return
+                        if (elements.isEmpty()) return
+
+                        // 快速检查：如果完全不包含可疑关键字，直接放行，极大提升性能
+                        var needsScrubbing = false
+                        for (element in elements) {
+                            val className = element.className
+                            val methodName = element.methodName
+                            if (suspiciousKeywords.any { className.contains(it) || methodName.contains(it) }) {
+                                needsScrubbing = true
+                                break
+                            }
+                        }
+                        if (!needsScrubbing) return
+
                         val cleanTrace = mutableListOf<StackTraceElement>()
                         var skipNextReflection = false
 
