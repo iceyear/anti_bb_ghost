@@ -4,6 +4,7 @@ import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.IXposedHookZygoteInit
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
+import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam
 
 class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
@@ -109,6 +110,49 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
             if (isBypassed) return
             isBypassed = true
             XposedBridge.log("TankeHook: Initializing stack trace scrubber...")
+
+            // ═══════════════════════════════════════════════════════════
+            // Hook 0: LoadedApk.createOrUpdateClassLoaderLocked — 幽灵对象拦截器
+            // 壳使用 Unsafe.allocateInstance 创建全空的"幽灵" LoadedApk 对象，
+            // 然后调用此方法引爆异常并检查堆栈中的 hook 痕迹。
+            // 问题：LSPosed 内置 hook 此方法，native HookBridge 处理全空对象
+            // 时会触发 SIGSEGV（null+0x88c）。
+            // 解决：在 beforeHookedMethod 中（priority 最高，先于 LSPosed 的 bridge）
+            // 检测幽灵对象（mPackageName==null），直接抛出干净的 NPE，
+            // 阻止调用进入 native bridge。
+            // ═══════════════════════════════════════════════════════════
+            try {
+                val loadedApkClass = XposedHelpers.findClass("android.app.LoadedApk", null)
+                val createCLMethod = XposedHelpers.findMethodExact(
+                    loadedApkClass,
+                    "createOrUpdateClassLoaderLocked",
+                    List::class.java
+                )
+                XposedBridge.hookMethod(createCLMethod, object : XC_MethodHook(10000) {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        try {
+                            // 检查关键字段：幽灵对象所有字段均为 null
+                            val mPackageName = XposedHelpers.getObjectField(param.thisObject, "mPackageName")
+                            if (mPackageName == null) {
+                                // 幽灵对象！抛出 NPE 阻止进入 native bridge
+                                // getStackTrace() hook 会在壳读取时清洗此异常的堆栈
+                                param.throwable = NullPointerException(
+                                    "Attempt to invoke virtual method on a null object reference"
+                                )
+                                return
+                            }
+                        } catch (_: Throwable) {
+                            // 字段访问失败也说明对象异常，同样拦截
+                            param.throwable = NullPointerException(
+                                "Attempt to invoke virtual method on a null object reference"
+                            )
+                        }
+                    }
+                })
+                XposedBridge.log("TankeHook: Hooked createOrUpdateClassLoaderLocked (ghost interceptor)")
+            } catch (e: Throwable) {
+                XposedBridge.log("TankeHook: Failed to hook createOrUpdateClassLoaderLocked: ${e.message}")
+            }
 
             // ═══════════════════════════════════════════════════════════
             // Hook 1: Throwable.getStackTrace() — 核心防线
