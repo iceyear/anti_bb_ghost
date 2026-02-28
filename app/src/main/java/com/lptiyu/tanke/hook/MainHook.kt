@@ -1,5 +1,6 @@
 package com.lptiyu.tanke.hook
 
+import android.util.Log
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.IXposedHookZygoteInit
 import de.robv.android.xposed.XC_MethodHook
@@ -35,35 +36,48 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
             while (cause != null) {
                 val originalTrace = cause.stackTrace
                 if (originalTrace != null && originalTrace.isNotEmpty()) {
-                    val cleanTrace = mutableListOf<StackTraceElement>()
-                    var skipNextReflection = false
-
-                    for (i in originalTrace.indices) {
-                        val element = originalTrace[i]
+                    // Quick check to avoid unnecessary array allocations if clean
+                    var needsScrubbing = false
+                    for (element in originalTrace) {
                         val className = element.className
                         val methodName = element.methodName
-
-                        val isSuspicious = suspiciousKeywords.any { keyword ->
-                            className.contains(keyword) || methodName.contains(keyword)
+                        if (suspiciousKeywords.any { className.contains(it) || methodName.contains(it) }) {
+                            needsScrubbing = true
+                            break
                         }
-
-                        if (isSuspicious) {
-                            skipNextReflection = true
-                            continue
-                        }
-
-                        if (skipNextReflection && className == "java.lang.reflect.Method" && methodName == "invoke") {
-                            skipNextReflection = false
-                            continue
-                        }
-
-                        skipNextReflection = false
-                        cleanTrace.add(element)
                     }
 
-                    if (cleanTrace.size != originalTrace.size) {
-                        cause.stackTrace = cleanTrace.toTypedArray()
-                        XposedBridge.log("TankeHook: Scrubbed ${originalTrace.size - cleanTrace.size} suspicious frames from ${cause.javaClass.simpleName}.")
+                    if (needsScrubbing) {
+                        val cleanTrace = mutableListOf<StackTraceElement>()
+                        var skipNextReflection = false
+
+                        for (i in originalTrace.indices) {
+                            val element = originalTrace[i]
+                            val className = element.className
+                            val methodName = element.methodName
+
+                            val isSuspicious = suspiciousKeywords.any { keyword ->
+                                className.contains(keyword) || methodName.contains(keyword)
+                            }
+
+                            if (isSuspicious) {
+                                skipNextReflection = true
+                                continue
+                            }
+
+                            if (skipNextReflection && className == "java.lang.reflect.Method" && methodName == "invoke") {
+                                skipNextReflection = false
+                                continue
+                            }
+
+                            skipNextReflection = false
+                            cleanTrace.add(element)
+                        }
+
+                        if (cleanTrace.size != originalTrace.size) {
+                            cause.stackTrace = cleanTrace.toTypedArray()
+                            XposedBridge.log("TankeHook: Scrubbed ${originalTrace.size - cleanTrace.size} suspicious frames from ${cause.javaClass.simpleName}.")
+                        }
                     }
                 }
                 cause = cause.cause
@@ -73,9 +87,30 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
         private fun bypassGhostInstanceDetection() {
             if (isBypassed) return
             isBypassed = true
-            XposedBridge.log("TankeHook: Initializing Ghost Instance stack trace scrubber...")
+            XposedBridge.log("TankeHook: Initializing Ultimate Exception scrubber...")
 
-            // 1. Hook LoadedApk.createOrUpdateClassLoaderLocked
+            // 1. Hook BaseDexClassLoader.findClass to catch ClassNotFoundException immediately when it's thrown
+            // 它是 LoadedApk 内部抛出 ClassNotFoundException 的源头，这样在 Slog.e 打印前我们就把它洗干净了
+            try {
+                val baseDexClassLoaderClass = XposedHelpers.findClass("dalvik.system.BaseDexClassLoader", null)
+                val findClassMethod = XposedHelpers.findMethodExact(
+                    baseDexClassLoaderClass,
+                    "findClass",
+                    String::class.java
+                )
+                XposedBridge.hookMethod(findClassMethod, object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        if (param.hasThrowable()) {
+                            scrubStackTrace(param.throwable)
+                        }
+                    }
+                })
+                XposedBridge.log("TankeHook: Hooked BaseDexClassLoader.findClass successfully")
+            } catch (e: Throwable) {
+                XposedBridge.log("TankeHook: Failed to hook BaseDexClassLoader: ${e.message}")
+            }
+
+            // 2. Hook LoadedApk.createOrUpdateClassLoaderLocked (for Ghost Instance NPE prevention)
             try {
                 val loadedApkClass = XposedHelpers.findClass("android.app.LoadedApk", null)
                 val createClassLoaderMethod = XposedHelpers.findMethodExact(
@@ -86,19 +121,51 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
                 XposedBridge.hookMethod(createClassLoaderMethod, object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        // 如果方法内部抛出了异常（比如壳传入幽灵对象导致的 NPE）
-                        // 在异常返回给壳之前，对其堆栈进行深度清洗
                         if (param.hasThrowable()) {
                             scrubStackTrace(param.throwable)
                         }
                     }
                 })
-                XposedBridge.log("TankeHook: Hooked LoadedApk.createOrUpdateClassLoaderLocked for stack scrubbing")
+                XposedBridge.log("TankeHook: Hooked LoadedApk.createOrUpdateClassLoaderLocked successfully")
             } catch (e: Throwable) {
                 XposedBridge.log("TankeHook: Failed to hook LoadedApk: ${e.message}")
             }
 
-            // 2. Hook ActivityThread.attach
+            // 3. Hook android.util.Slog.e and Log.e
+            // 这样即便上面漏掉了，在即将写入 logcat 的那一刻也会被强行洗干净！
+            try {
+                val slogClass = XposedHelpers.findClass("android.util.Slog", null)
+                val slogEMethod = XposedHelpers.findMethodExact(slogClass, "e", String::class.java, String::class.java, Throwable::class.java)
+                XposedBridge.hookMethod(slogEMethod, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val throwable = param.args[2] as? Throwable
+                        if (throwable != null) {
+                            scrubStackTrace(throwable)
+                        }
+                    }
+                })
+                XposedBridge.log("TankeHook: Hooked android.util.Slog.e successfully")
+            } catch (e: Throwable) {
+                XposedBridge.log("TankeHook: Failed to hook android.util.Slog: ${e.message}")
+            }
+
+            try {
+                val logClass = Log::class.java
+                val logEMethod = XposedHelpers.findMethodExact(logClass, "e", String::class.java, String::class.java, Throwable::class.java)
+                XposedBridge.hookMethod(logEMethod, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val throwable = param.args[2] as? Throwable
+                        if (throwable != null) {
+                            scrubStackTrace(throwable)
+                        }
+                    }
+                })
+                XposedBridge.log("TankeHook: Hooked android.util.Log.e successfully")
+            } catch (e: Throwable) {
+                XposedBridge.log("TankeHook: Failed to hook android.util.Log: ${e.message}")
+            }
+
+            // 4. ActivityThread.attach
             try {
                 val activityThreadClass = XposedHelpers.findClass("android.app.ActivityThread", null)
                 val attachMethod = XposedHelpers.findMethodExact(
@@ -115,13 +182,10 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         }
                     }
                 })
-                XposedBridge.log("TankeHook: Hooked ActivityThread.attach for stack scrubbing")
             } catch (e: Throwable) {
-                XposedBridge.log("TankeHook: Failed to hook ActivityThread: ${e.message}")
             }
 
-            // 3. Hook Throwable.getStackTrace (兜底防护，如果壳主动调用 e.getStackTrace())
-            // 避免高频调用导致的性能问题，这里只对可疑对象起效，且内部不抛异常
+            // 5. Throwable.getStackTrace (兜底防护)
             try {
                 val getStackTraceMethod = Throwable::class.java.getDeclaredMethod("getStackTrace")
                 XposedBridge.hookMethod(getStackTraceMethod, object : XC_MethodHook() {
@@ -129,7 +193,6 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         val elements = param.result as? Array<StackTraceElement> ?: return
                         if (elements.isEmpty()) return
 
-                        // 快速检查：如果完全不包含可疑关键字，直接放行，极大提升性能
                         var needsScrubbing = false
                         for (element in elements) {
                             val className = element.className
@@ -172,9 +235,7 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         }
                     }
                 })
-                XposedBridge.log("TankeHook: Hooked Throwable.getStackTrace successfully")
             } catch (e: Throwable) {
-                XposedBridge.log("TankeHook: Failed to hook Throwable.getStackTrace: ${e.message}")
             }
         }
     }
