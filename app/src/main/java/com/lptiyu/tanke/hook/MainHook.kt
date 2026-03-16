@@ -19,6 +19,7 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
         private var okhttpHooksInstalled = false
         private var trustManagerHooksInstalled = false
         private val hookedHostnameVerifierClasses = HashSet<String>()
+        private val isInstallingNetworkHooks = ThreadLocal.withInitial { false }
         private const val GHOST_MARKER = "\$\$ghost_detect\$\$"
 
         private val permissiveHostnameVerifier = javax.net.ssl.HostnameVerifier { _, _ -> true }
@@ -402,17 +403,24 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                     String::class.java,
                     object : XC_MethodHook() {
                         override fun afterHookedMethod(param: MethodHookParam) {
+                            if (isInstallingNetworkHooks.get()) return
+
                             val name = param.args[0] as? String ?: return
                             val loader = param.thisObject as? ClassLoader ?: return
                             val loadedClass = param.result as? Class<*> ?: return
 
-                            installHostnameVerifierBypassForClass(name, loadedClass)
+                            isInstallingNetworkHooks.set(true)
+                            try {
+                                installHostnameVerifierBypassForClass(name, loadedClass)
 
-                            if (!ossHttpDnsHooksInstalled && name.startsWith("com.alibaba.sdk.android.oss")) {
-                                installOssHttpDnsBypass(loader)
-                            }
-                            if (!okhttpHooksInstalled && name.startsWith("okhttp3")) {
-                                installOkHttpPinningBypass(loader)
+                                if (!ossHttpDnsHooksInstalled && name.startsWith("com.alibaba.sdk.android.oss")) {
+                                    installOssHttpDnsBypass(loader)
+                                }
+                                if (!okhttpHooksInstalled && name.startsWith("okhttp3")) {
+                                    installOkHttpPinningBypass(loader)
+                                }
+                            } finally {
+                                isInstallingNetworkHooks.set(false)
                             }
                         }
                     }
