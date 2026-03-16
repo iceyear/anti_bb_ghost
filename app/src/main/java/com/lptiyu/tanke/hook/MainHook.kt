@@ -475,7 +475,8 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                                     installAdSdkHooks(loader)
                                 }
                                 if (prefSkipSplashAd && !splashAdHookInstalled &&
-                                        name == "com.lptiyu.tanke.activities.splash.SplashActivity") {
+                                        (name == "com.lptiyu.tanke.activities.splash.SplashActivity" ||
+                                         name == "com.yfanads.android.core.splash.YFAdSplashAds")) {
                                     installSplashAdHooks(loader)
                                 }
                             } finally {
@@ -648,19 +649,22 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
             // — YFAds ——————————————————————————————————————————
             if (prefDisableAds) {
                 try {
-                    XposedHelpers.findAndHookMethod(
-                        "com.yfanads.android.YFAdsManager", classLoader,
-                        "init",
-                        android.app.Application::class.java,
-                        XposedHelpers.findClass("com.yfanads.android.model.YFAdsConfig", classLoader),
-                        object : XC_MethodHook() {
-                            override fun beforeHookedMethod(param: MethodHookParam) {
-                                vlog("YFAdsManager.init() blocked")
-                                param.result = null
-                            }
+                    val yfMgrClass = XposedHelpers.findClass("com.yfanads.android.YFAdsManager", classLoader)
+                    // 查找所有名为 init 的方法并 hook（避免依赖 YFAdsConfig 的类引用）
+                    var hooked = false
+                    for (method in yfMgrClass.declaredMethods) {
+                        if (method.name == "init") {
+                            XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                                override fun beforeHookedMethod(param: MethodHookParam) {
+                                    vlog("YFAdsManager.init() blocked")
+                                    param.result = null
+                                }
+                            })
+                            hooked = true
                         }
-                    )
-                    XposedBridge.log("TankeHook: Hooked YFAdsManager.init()")
+                    }
+                    if (hooked) XposedBridge.log("TankeHook: Hooked YFAdsManager.init()")
+                    else XposedBridge.log("TankeHook: YFAdsManager.init method not found")
                 } catch (e: Throwable) {
                     XposedBridge.log("TankeHook: YFAdsManager hook failed: ${e.message}")
                 }
@@ -776,57 +780,63 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
         /**
          * 拦截 SplashActivity 中的广告展示方法，跳过开屏广告直接进入主界面。
          * 由 ClassLoader.loadClass 监听器触发，在 SplashActivity 首次加载时安装。
+         *
+         * 策略：
+         * - 不拦截 initSdk()（它还负责初始化 token/网络等关键功能）
+         * - 拦截 YFAdSplashAds.showAds() 并立即触发 onAdClosed() 回调，
+         *   模拟广告正常关闭，使 SplashActivity 继续执行跳转逻辑
+         * - 同时拦截 fetchAd() 阻止广告请求
          */
         private fun installSplashAdHooks(classLoader: ClassLoader) {
             if (splashAdHookInstalled) return
             splashAdHookInstalled = true
 
             XposedBridge.log("TankeHook: Installing SplashActivity ad hooks...")
+
+            // Hook YFAdSplashAds.showAds() — 核心：立即触发 onAdClosed 回调跳过广告
+            try {
+                XposedHelpers.findAndHookMethod(
+                    "com.yfanads.android.core.splash.YFAdSplashAds", classLoader,
+                    "showAds",
+                    android.app.Activity::class.java,
+                    android.view.ViewGroup::class.java,
+                    object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            vlog("YFAdSplashAds.showAds() intercepted, triggering onAdClosed()")
+                            param.result = null  // 阻止广告展示
+                            // 立即通过 listener 触发广告关闭回调，使 SplashActivity 执行跳转
+                            try {
+                                val listener = XposedHelpers.getObjectField(param.thisObject, "listener")
+                                if (listener != null) {
+                                    XposedHelpers.callMethod(listener, "onAdClosed")
+                                    vlog("YFAdSplashAds: onAdClosed() triggered on listener: ${listener.javaClass.name}")
+                                }
+                            } catch (e: Throwable) {
+                                XposedBridge.log("TankeHook: Failed to trigger onAdClosed: ${e.message}")
+                            }
+                        }
+                    }
+                )
+                XposedBridge.log("TankeHook: Hooked YFAdSplashAds.showAds()")
+            } catch (e: Throwable) {
+                XposedBridge.log("TankeHook: YFAdSplashAds.showAds hook failed: ${e.message}")
+            }
+
+            // Hook SplashActivity.fetchAd() — 阻止广告请求网络（次要防线）
             try {
                 val splashClass = XposedHelpers.findClass(
                     "com.lptiyu.tanke.activities.splash.SplashActivity", classLoader
                 )
-
-                try {
-                    val showAdMethod = splashClass.getDeclaredMethod("showAd")
-                    XposedBridge.hookMethod(showAdMethod, object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            vlog("SplashActivity.showAd() skipped")
-                            param.result = null
-                        }
-                    })
-                    XposedBridge.log("TankeHook: Hooked SplashActivity.showAd()")
-                } catch (e: Throwable) {
-                    XposedBridge.log("TankeHook: showAd hook failed: ${e.message}")
-                }
-
-                try {
-                    val fetchAdMethod = splashClass.getDeclaredMethod("fetchAd", String::class.java)
-                    XposedBridge.hookMethod(fetchAdMethod, object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            vlog("SplashActivity.fetchAd() skipped")
-                            param.result = null
-                        }
-                    })
-                    XposedBridge.log("TankeHook: Hooked SplashActivity.fetchAd()")
-                } catch (e: Throwable) {
-                    XposedBridge.log("TankeHook: fetchAd hook failed: ${e.message}")
-                }
-
-                try {
-                    val initSdkMethod = splashClass.getDeclaredMethod("initSdk")
-                    XposedBridge.hookMethod(initSdkMethod, object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            vlog("SplashActivity.initSdk() skipped")
-                            param.result = null
-                        }
-                    })
-                    XposedBridge.log("TankeHook: Hooked SplashActivity.initSdk()")
-                } catch (e: Throwable) {
-                    XposedBridge.log("TankeHook: initSdk hook failed: ${e.message}")
-                }
+                val fetchAdMethod = splashClass.getDeclaredMethod("fetchAd", String::class.java)
+                XposedBridge.hookMethod(fetchAdMethod, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        vlog("SplashActivity.fetchAd() skipped")
+                        param.result = null
+                    }
+                })
+                XposedBridge.log("TankeHook: Hooked SplashActivity.fetchAd()")
             } catch (e: Throwable) {
-                XposedBridge.log("TankeHook: SplashActivity class not available: ${e.message}")
+                XposedBridge.log("TankeHook: fetchAd hook failed: ${e.message}")
             }
         }
 

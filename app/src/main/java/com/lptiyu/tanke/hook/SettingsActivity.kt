@@ -2,6 +2,7 @@ package com.lptiyu.tanke.hook
 
 import android.app.Activity
 import android.content.Context
+import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.Typeface
 import android.os.Bundle
@@ -16,6 +17,7 @@ import android.widget.TextView
 /**
  * LSPosed 模块设置界面。
  * 纯代码构建 UI，无需 XML/AppCompat，最小化依赖。
+ * 支持跟随系统深色/浅色模式。
  *
  * 开关值保存在 MODE_WORLD_READABLE SharedPreferences；
  * MainHook 在每次 handleLoadPackage 时通过 XSharedPreferences 读取。
@@ -33,6 +35,18 @@ class SettingsActivity : Activity() {
         const val KEY_ANTI_DETECT        = "anti_detect"
         const val KEY_VERBOSE_LOG        = "verbose_log"
     }
+
+    // 颜色方案（随系统深浅色变化）
+    private val isDark get() =
+        (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+                Configuration.UI_MODE_NIGHT_YES
+
+    private val colorBackground  get() = if (isDark) Color.parseColor("#1C1C1E") else Color.parseColor("#F2F2F7")
+    private val colorCard        get() = if (isDark) Color.parseColor("#2C2C2E") else Color.WHITE
+    private val colorPrimary     get() = if (isDark) Color.WHITE                 else Color.parseColor("#1C1C1E")
+    private val colorSecondary   get() = if (isDark) Color.parseColor("#8E8E93") else Color.parseColor("#8E8E93")
+    private val colorSectionLabel get() = if (isDark) Color.parseColor("#8E8E93") else Color.parseColor("#6D6D72")
+    private val colorDivider     get() = if (isDark) Color.parseColor("#38383A") else Color.parseColor("#C6C6C8")
 
     private data class PrefEntry(
         val key: String,
@@ -58,11 +72,21 @@ class SettingsActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        buildUi()
+    }
 
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        // 深浅色切换时重建 UI
+        buildUi()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun buildUi() {
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_WORLD_READABLE)
 
         val root = ScrollView(this).apply {
-            setBackgroundColor(Color.parseColor("#F2F2F7"))
+            setBackgroundColor(colorBackground)
         }
 
         val container = LinearLayout(this).apply {
@@ -70,11 +94,9 @@ class SettingsActivity : Activity() {
             setPadding(0, dp(16), 0, dp(32))
         }
 
-        // 标题卡片
         container.addView(buildSectionHeader("Tanke LSPosed Hook"))
         container.addView(buildCaption("设置将在下次目标应用启动时生效"))
 
-        // 功能开关列表
         container.addView(buildSectionLabel("功能开关"))
         val card = buildCard()
         entries.forEachIndexed { index, entry ->
@@ -83,12 +105,15 @@ class SettingsActivity : Activity() {
         }
         container.addView(card)
 
-        // 说明
         container.addView(buildCaption("部分功能需要 LSPosed 框架版本 ≥ 1.9.2，且模块已激活作用域为 com.lptiyu.tanke。"))
 
         root.addView(container)
         setContentView(root)
         title = "Tanke Hook 设置"
+
+        // 更新系统状态栏颜色（API 21+）
+        window.statusBarColor = colorBackground
+        window.navigationBarColor = colorBackground
     }
 
     @Suppress("DEPRECATION")
@@ -102,6 +127,7 @@ class SettingsActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             setPadding(dp(16), dp(14), dp(12), dp(14))
             gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(colorCard)
         }
 
         val texts = LinearLayout(this).apply {
@@ -112,13 +138,13 @@ class SettingsActivity : Activity() {
         val titleView = TextView(this).apply {
             text = entry.title
             textSize = 16f
-            setTextColor(Color.parseColor("#1C1C1E"))
+            setTextColor(colorPrimary)
             setTypeface(typeface, Typeface.NORMAL)
         }
         val summaryView = TextView(this).apply {
             text = entry.summary
             textSize = 13f
-            setTextColor(Color.parseColor("#8E8E93"))
+            setTextColor(colorSecondary)
             maxLines = 2
             ellipsize = TextUtils.TruncateAt.END
         }
@@ -140,7 +166,7 @@ class SettingsActivity : Activity() {
         val wrapper = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         wrapper.addView(row)
         wrapper.addView(View(this).apply {
-            setBackgroundColor(Color.parseColor("#C6C6C8"))
+            setBackgroundColor(colorDivider)
             val lp = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 1
             ).apply { marginStart = dp(16) }
@@ -152,7 +178,7 @@ class SettingsActivity : Activity() {
     private fun buildCard(): LinearLayout {
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.WHITE)
+            setBackgroundColor(colorCard)
             val lp = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
@@ -160,7 +186,6 @@ class SettingsActivity : Activity() {
                 setMargins(dp(16), 0, dp(16), dp(8))
             }
             layoutParams = lp
-            // 圆角阴影通过 elevation 实现（API 21+）
             elevation = dp(2).toFloat()
         }
     }
@@ -170,7 +195,7 @@ class SettingsActivity : Activity() {
             this.text = text
             textSize = 22f
             setTypeface(typeface, Typeface.BOLD)
-            setTextColor(Color.parseColor("#1C1C1E"))
+            setTextColor(colorPrimary)
             val lp = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
@@ -183,7 +208,7 @@ class SettingsActivity : Activity() {
         return TextView(this).apply {
             this.text = text.uppercase()
             textSize = 12f
-            setTextColor(Color.parseColor("#6D6D72"))
+            setTextColor(colorSectionLabel)
             val lp = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
@@ -196,7 +221,7 @@ class SettingsActivity : Activity() {
         return TextView(this).apply {
             this.text = text
             textSize = 12f
-            setTextColor(Color.parseColor("#8E8E93"))
+            setTextColor(colorSecondary)
             val lp = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
