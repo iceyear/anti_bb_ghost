@@ -13,8 +13,14 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
     companion object {
         private var isBypassed = false
-        private var networkBypassInstalled = false
+        private var networkBootstrapInstalled = false
+        private var classLoaderMonitorInstalled = false
+        private var ossHttpDnsHooksInstalled = false
+        private var okhttpHooksInstalled = false
+        private var trustManagerHooksInstalled = false
         private const val GHOST_MARKER = "\$\$ghost_detect\$\$"
+
+        private val permissiveHostnameVerifier = javax.net.ssl.HostnameVerifier { _, _ -> true }
 
         /** 重入锁：防止 getStackTrace() hook 内部触发递归调用 */
         private val isProcessing = ThreadLocal.withInitial { false }
@@ -375,16 +381,45 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
         // ── Network hooks: for traffic capture only in target app ─────────
         private fun installNetworkCaptureHooks(classLoader: ClassLoader?) {
-            if (networkBypassInstalled || classLoader == null) return
-            networkBypassInstalled = true
+            if (networkBootstrapInstalled || classLoader == null) return
+            networkBootstrapInstalled = true
             XposedBridge.log("TankeHook: Installing network capture hooks...")
 
+            installTrustManagerBypass()
             installOssHttpDnsBypass(classLoader)
             installOkHttpPinningBypass(classLoader)
-            installTrustManagerBypass()
+            installClassLoaderMonitor()
+        }
+
+        private fun installClassLoaderMonitor() {
+            if (classLoaderMonitorInstalled) return
+            classLoaderMonitorInstalled = true
+            try {
+                XposedHelpers.findAndHookMethod(
+                    ClassLoader::class.java,
+                    "loadClass",
+                    String::class.java,
+                    object : XC_MethodHook() {
+                        override fun afterHookedMethod(param: MethodHookParam) {
+                            val name = param.args[0] as? String ?: return
+                            val loader = param.thisObject as? ClassLoader ?: return
+                            if (!ossHttpDnsHooksInstalled && name.startsWith("com.alibaba.sdk.android.oss")) {
+                                installOssHttpDnsBypass(loader)
+                            }
+                            if (!okhttpHooksInstalled && name.startsWith("okhttp3")) {
+                                installOkHttpPinningBypass(loader)
+                            }
+                        }
+                    }
+                )
+                XposedBridge.log("TankeHook: Hooked ClassLoader.loadClass for delayed network hooks")
+            } catch (e: Throwable) {
+                XposedBridge.log("TankeHook: ClassLoader monitor hook failed: ${e.message}")
+            }
         }
 
         private fun installOssHttpDnsBypass(classLoader: ClassLoader) {
+            if (ossHttpDnsHooksInstalled) return
             try {
                 XposedHelpers.findAndHookMethod(
                     "com.alibaba.sdk.android.oss.ClientConfiguration",
@@ -396,12 +431,7 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         }
                     }
                 )
-                XposedBridge.log("TankeHook: Hooked ClientConfiguration.isHttpDnsEnable()")
-            } catch (e: Throwable) {
-                XposedBridge.log("TankeHook: HttpDNS getter hook failed: ${e.message}")
-            }
 
-            try {
                 XposedHelpers.findAndHookMethod(
                     "com.alibaba.sdk.android.oss.ClientConfiguration",
                     classLoader,
@@ -413,12 +443,7 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         }
                     }
                 )
-                XposedBridge.log("TankeHook: Hooked ClientConfiguration.setHttpDnsEnable(boolean)")
-            } catch (e: Throwable) {
-                XposedBridge.log("TankeHook: HttpDNS setter hook failed: ${e.message}")
-            }
 
-            try {
                 XposedHelpers.findAndHookMethod(
                     "com.alibaba.sdk.android.oss.internal.InternalRequestOperation",
                     classLoader,
@@ -430,13 +455,38 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         }
                     }
                 )
-                XposedBridge.log("TankeHook: Hooked InternalRequestOperation.checkIfHttpDnsAvailable(boolean)")
+
+                // 直接兜底域名校验，处理代理证书 SAN 不匹配导致的 Hostname not verified。
+                XposedHelpers.findAndHookConstructor(
+                    "com.alibaba.sdk.android.oss.internal.InternalRequestOperation",
+                    classLoader,
+                    android.content.Context::class.java,
+                    java.net.URI::class.java,
+                    XposedHelpers.findClass("com.alibaba.sdk.android.oss.common.auth.OSSCredentialProvider", classLoader),
+                    XposedHelpers.findClass("com.alibaba.sdk.android.oss.ClientConfiguration", classLoader),
+                    object : XC_MethodHook() {
+                        override fun afterHookedMethod(param: MethodHookParam) {
+                            try {
+                                val client = XposedHelpers.getObjectField(param.thisObject, "innerClient")
+                                val builder = XposedHelpers.callMethod(client, "newBuilder")
+                                XposedHelpers.callMethod(builder, "hostnameVerifier", permissiveHostnameVerifier)
+                                val rebuilt = XposedHelpers.callMethod(builder, "build")
+                                XposedHelpers.setObjectField(param.thisObject, "innerClient", rebuilt)
+                            } catch (_: Throwable) {
+                            }
+                        }
+                    }
+                )
+
+                ossHttpDnsHooksInstalled = true
+                XposedBridge.log("TankeHook: OSS HttpDNS + hostname hooks installed")
             } catch (e: Throwable) {
-                XposedBridge.log("TankeHook: Internal httpdns hook failed: ${e.message}")
+                XposedBridge.log("TankeHook: OSS hooks delayed, class not ready: ${e.message}")
             }
         }
 
         private fun installOkHttpPinningBypass(classLoader: ClassLoader) {
+            if (okhttpHooksInstalled) return
             try {
                 val certPinnerClass = XposedHelpers.findClass("okhttp3.CertificatePinner", classLoader)
 
@@ -454,15 +504,8 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         param.result = null
                     }
                 })
-                XposedBridge.log("TankeHook: Hooked okhttp3.CertificatePinner.check(..)")
-            } catch (e: Throwable) {
-                XposedBridge.log("TankeHook: CertificatePinner hook failed: ${e.message}")
-            }
 
-            try {
-                val certPinnerClass = XposedHelpers.findClass("okhttp3.CertificatePinner", classLoader)
                 val defaultPinner = certPinnerClass.getDeclaredField("DEFAULT").get(null)
-
                 XposedHelpers.findAndHookMethod(
                     "okhttp3.OkHttpClient\$Builder",
                     classLoader,
@@ -474,14 +517,34 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         }
                     }
                 )
-                XposedBridge.log("TankeHook: Hooked OkHttpClient.Builder.certificatePinner(..)")
-            } catch (e: Throwable) {
-                XposedBridge.log("TankeHook: Builder.certificatePinner hook failed: ${e.message}")
-            }
 
+                try {
+                    XposedHelpers.findAndHookMethod(
+                        "okhttp3.internal.tls.OkHostnameVerifier",
+                        classLoader,
+                        "verify",
+                        String::class.java,
+                        javax.net.ssl.SSLSession::class.java,
+                        object : XC_MethodHook() {
+                            override fun beforeHookedMethod(param: MethodHookParam) {
+                                param.result = true
+                            }
+                        }
+                    )
+                } catch (_: Throwable) {
+                }
+
+                okhttpHooksInstalled = true
+                XposedBridge.log("TankeHook: OkHttp pinning + hostname hooks installed")
+            } catch (e: Throwable) {
+                XposedBridge.log("TankeHook: OkHttp hooks delayed, class not ready: ${e.message}")
+            }
         }
 
         private fun installTrustManagerBypass() {
+            if (trustManagerHooksInstalled) return
+            var installed = false
+
             // Android Conscrypt 常见证书链校验入口
             try {
                 val trustManagerImplClass = Class.forName("com.android.org.conscrypt.TrustManagerImpl")
@@ -495,10 +558,27 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         }
                     })
                 }
+                installed = true
                 XposedBridge.log("TankeHook: Hooked TrustManagerImpl.verifyChain(..)")
             } catch (e: Throwable) {
                 XposedBridge.log("TankeHook: TrustManagerImpl hook failed: ${e.message}")
             }
+
+            // 兜底替换默认 HostnameVerifier，覆盖 HttpsURLConnection 默认校验。
+            try {
+                val m = javax.net.ssl.HttpsURLConnection::class.java.getDeclaredMethod("getDefaultHostnameVerifier")
+                XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        param.result = permissiveHostnameVerifier
+                    }
+                })
+                installed = true
+                XposedBridge.log("TankeHook: Hooked HttpsURLConnection.getDefaultHostnameVerifier()")
+            } catch (e: Throwable) {
+                XposedBridge.log("TankeHook: HttpsURLConnection hostname hook failed: ${e.message}")
+            }
+
+            trustManagerHooksInstalled = installed
         }
     }
 
