@@ -1,20 +1,34 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <!-- No launcher icon needed, just xposed stuff -->
     <application
         android:label="Tanke LSPosed Hook"
+        android:icon="@android:drawable/ic_menu_preferences"
         android:hasCode="true">
+
+        <!-- LSPosed 模块元数据 -->
         <meta-data
             android:name="xposedmodule"
             android:value="true" />
         <meta-data
             android:name="xposeddescription"
-            android:value="Hooks and bypasses anti-hook detection for com.lptiyu.tanke" />
+            android:value="步道乐跑辅助：反检测 / 去广告 / SSL Pinning 绕过 / 抓包辅助" />
         <meta-data
             android:name="xposedminversion"
             android:value="93" />
         <meta-data
             android:name="xposedscope"
             android:value="com.lptiyu.tanke" />
+
+        <!-- 设置界面 Activity，可从启动器直接打开 -->
+        <activity
+            android:name=".SettingsActivity"
+            android:label="Tanke Hook 设置"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
     </application>
 </manifest>

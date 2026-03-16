@@ -18,9 +18,47 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
         private var ossHttpDnsHooksInstalled = false
         private var okhttpHooksInstalled = false
         private var trustManagerHooksInstalled = false
+        private var adHooksInstalled = false
+        private var splashAdHookInstalled = false
         private val hookedHostnameVerifierClasses = HashSet<String>()
         private val isInstallingNetworkHooks = ThreadLocal.withInitial { false }
         private const val GHOST_MARKER = "\$\$ghost_detect\$\$"
+
+        // ═══════════════════════════════════════════════════════════
+        //  SharedPreferences 开关（通过 XSharedPreferences 读取）
+        //  在 handleLoadPackage 时初始化，之后只读不写
+        // ═══════════════════════════════════════════════════════════
+        private var prefBypassSsl      = true
+        private var prefDisableHttpdns = true
+        private var prefDisableAds     = true
+        private var prefSkipSplashAd   = true
+        private var prefAntiDetect     = true
+        private var prefVerboseLog     = false
+
+        @Suppress("DEPRECATION")
+        private fun loadPrefs() {
+            try {
+                val xsp = de.robv.android.xposed.XSharedPreferences(
+                    "com.lptiyu.tanke.hook",
+                    SettingsActivity.PREFS_NAME
+                )
+                xsp.makeWorldReadable()
+                xsp.reload()
+                prefBypassSsl      = xsp.getBoolean(SettingsActivity.KEY_BYPASS_SSL,         true)
+                prefDisableHttpdns = xsp.getBoolean(SettingsActivity.KEY_DISABLE_HTTPDNS,    true)
+                prefDisableAds     = xsp.getBoolean(SettingsActivity.KEY_DISABLE_ADS,        true)
+                prefSkipSplashAd   = xsp.getBoolean(SettingsActivity.KEY_SKIP_SPLASH_AD,     true)
+                prefAntiDetect     = xsp.getBoolean(SettingsActivity.KEY_ANTI_DETECT,        true)
+                prefVerboseLog     = xsp.getBoolean(SettingsActivity.KEY_VERBOSE_LOG,        false)
+                XposedBridge.log("TankeHook: Prefs loaded — ssl=$prefBypassSsl httpdns=$prefDisableHttpdns ads=$prefDisableAds splash=$prefSkipSplashAd antiDetect=$prefAntiDetect verbose=$prefVerboseLog")
+            } catch (e: Throwable) {
+                XposedBridge.log("TankeHook: Failed to load prefs (using defaults): ${e.message}")
+            }
+        }
+
+        private fun vlog(msg: String) {
+            if (prefVerboseLog) XposedBridge.log("TankeHook[V]: $msg")
+        }
 
         private val permissiveHostnameVerifier = javax.net.ssl.HostnameVerifier { _, _ -> true }
 
@@ -152,6 +190,7 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
             isBypassed = true
             XposedBridge.log("TankeHook: Installing hooks...")
 
+            // 反检测 Hooks 在 Zygote 阶段安装，不受开关约束（因为 prefs 此时还未读取）
             installUnsafeHook()
             installGhostInterceptor()
             installStackTraceElementHooks()
@@ -385,11 +424,17 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
         private fun installNetworkCaptureHooks(classLoader: ClassLoader?) {
             if (networkBootstrapInstalled || classLoader == null) return
             networkBootstrapInstalled = true
-            XposedBridge.log("TankeHook: Installing network capture hooks...")
+            XposedBridge.log("TankeHook: Installing network capture hooks (ssl=$prefBypassSsl httpdns=$prefDisableHttpdns)...")
 
-            installTrustManagerBypass()
-            installOssHttpDnsBypass(classLoader)
-            installOkHttpPinningBypass(classLoader)
+            if (prefBypassSsl) {
+                installTrustManagerBypass()
+            }
+            if (prefBypassSsl || prefDisableHttpdns) {
+                installOssHttpDnsBypass(classLoader)
+            }
+            if (prefBypassSsl) {
+                installOkHttpPinningBypass(classLoader)
+            }
             installClassLoaderMonitor()
         }
 
@@ -411,13 +456,27 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
                             isInstallingNetworkHooks.set(true)
                             try {
-                                installHostnameVerifierBypassForClass(name, loadedClass)
+                                if (prefBypassSsl) {
+                                    installHostnameVerifierBypassForClass(name, loadedClass)
+                                }
 
-                                if (!ossHttpDnsHooksInstalled && name.startsWith("com.alibaba.sdk.android.oss")) {
+                                if (prefDisableHttpdns && !ossHttpDnsHooksInstalled &&
+                                        name.startsWith("com.alibaba.sdk.android.oss")) {
                                     installOssHttpDnsBypass(loader)
                                 }
-                                if (!okhttpHooksInstalled && name.startsWith("okhttp3")) {
+                                if (prefBypassSsl && !okhttpHooksInstalled && name.startsWith("okhttp3")) {
                                     installOkHttpPinningBypass(loader)
+                                }
+                                if ((prefDisableAds || prefSkipSplashAd) && !adHooksInstalled &&
+                                        (name.startsWith("com.yfanads") ||
+                                         name.startsWith("com.beizi") ||
+                                         name.startsWith("com.kwad") ||
+                                         name.startsWith("com.bytedance.sdk.openadsdk"))) {
+                                    installAdSdkHooks(loader)
+                                }
+                                if (prefSkipSplashAd && !splashAdHookInstalled &&
+                                        name == "com.lptiyu.tanke.activities.splash.SplashActivity") {
+                                    installSplashAdHooks(loader)
                                 }
                             } finally {
                                 isInstallingNetworkHooks.set(false)
@@ -575,8 +634,203 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
             }
         }
 
-        private fun installTrustManagerBypass() {
-            if (trustManagerHooksInstalled) return
+        // ── Ad SDK Hooks ──────────────────────────────────────────
+        /**
+         * 拦截各广告 SDK 的初始化方法，阻止其完成初始化。
+         * 由 ClassLoader.loadClass 监听器触发，在相关 SDK 类首次加载时安装。
+         */
+        private fun installAdSdkHooks(classLoader: ClassLoader) {
+            if (adHooksInstalled) return
+            adHooksInstalled = true
+
+            XposedBridge.log("TankeHook: Installing Ad SDK hooks (disableAds=$prefDisableAds)...")
+
+            // — YFAds ——————————————————————————————————————————
+            if (prefDisableAds) {
+                try {
+                    XposedHelpers.findAndHookMethod(
+                        "com.yfanads.android.YFAdsManager", classLoader,
+                        "init",
+                        android.app.Application::class.java,
+                        XposedHelpers.findClass("com.yfanads.android.model.YFAdsConfig", classLoader),
+                        object : XC_MethodHook() {
+                            override fun beforeHookedMethod(param: MethodHookParam) {
+                                vlog("YFAdsManager.init() blocked")
+                                param.result = null
+                            }
+                        }
+                    )
+                    XposedBridge.log("TankeHook: Hooked YFAdsManager.init()")
+                } catch (e: Throwable) {
+                    XposedBridge.log("TankeHook: YFAdsManager hook failed: ${e.message}")
+                }
+
+                try {
+                    XposedHelpers.findAndHookMethod(
+                        "com.yfanads.android.YFAdsManager", classLoader,
+                        "isInitSuc",
+                        object : XC_MethodHook() {
+                            override fun afterHookedMethod(param: MethodHookParam) {
+                                vlog("YFAdsManager.isInitSuc() → false")
+                                param.result = false
+                            }
+                        }
+                    )
+                } catch (_: Throwable) {}
+            }
+
+            // — BeiZi 北智融合广告 ─────────────────────────────────
+            if (prefDisableAds) {
+                try {
+                    XposedHelpers.findAndHookMethod(
+                        "com.beizi.fusion.BeiZis", classLoader,
+                        "init",
+                        android.content.Context::class.java,
+                        String::class.java,
+                        object : XC_MethodHook() {
+                            override fun beforeHookedMethod(param: MethodHookParam) {
+                                vlog("BeiZis.init() blocked")
+                                param.result = null
+                            }
+                        }
+                    )
+                    XposedBridge.log("TankeHook: Hooked BeiZis.init()")
+                } catch (e: Throwable) {
+                    XposedBridge.log("TankeHook: BeiZis.init hook failed: ${e.message}")
+                }
+                try {
+                    XposedHelpers.findAndHookMethod(
+                        "com.beizi.fusion.BeiZis", classLoader,
+                        "asyncInit",
+                        android.content.Context::class.java,
+                        String::class.java,
+                        object : XC_MethodHook() {
+                            override fun beforeHookedMethod(param: MethodHookParam) {
+                                vlog("BeiZis.asyncInit() blocked")
+                                param.result = null
+                            }
+                        }
+                    )
+                } catch (_: Throwable) {}
+            }
+
+            // — 快手 KsAdSDK ───────────────────────────────────────
+            if (prefDisableAds) {
+                try {
+                    val ksConfigClass = XposedHelpers.findClass(
+                        "com.kwad.sdk.api.SdkConfig", classLoader
+                    )
+                    XposedHelpers.findAndHookMethod(
+                        "com.kwad.sdk.api.KsAdSDK", classLoader,
+                        "init",
+                        android.content.Context::class.java,
+                        ksConfigClass,
+                        object : XC_MethodHook() {
+                            override fun beforeHookedMethod(param: MethodHookParam) {
+                                vlog("KsAdSDK.init() blocked")
+                                param.result = false
+                            }
+                        }
+                    )
+                    XposedBridge.log("TankeHook: Hooked KsAdSDK.init()")
+                } catch (e: Throwable) {
+                    XposedBridge.log("TankeHook: KsAdSDK.init hook failed: ${e.message}")
+                }
+                try {
+                    XposedHelpers.findAndHookMethod(
+                        "com.kwad.sdk.api.KsAdSDK", classLoader,
+                        "start",
+                        object : XC_MethodHook() {
+                            override fun beforeHookedMethod(param: MethodHookParam) {
+                                vlog("KsAdSDK.start() blocked")
+                                param.result = null
+                            }
+                        }
+                    )
+                } catch (_: Throwable) {}
+            }
+
+            // — 字节跳动 Pangle/TTAdSdk ────────────────────────────
+            if (prefDisableAds) {
+                try {
+                    val clazz = XposedHelpers.findClass(
+                        "com.bytedance.sdk.openadsdk.TTAdSdk", classLoader
+                    )
+                    for (method in clazz.declaredMethods) {
+                        if (method.name == "init" || method.name == "start") {
+                            XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                                override fun beforeHookedMethod(param: MethodHookParam) {
+                                    vlog("TTAdSdk.${method.name}() blocked")
+                                    param.result = null
+                                }
+                            })
+                        }
+                    }
+                    XposedBridge.log("TankeHook: Hooked TTAdSdk init/start")
+                } catch (e: Throwable) {
+                    XposedBridge.log("TankeHook: TTAdSdk hook skipped (may not be present): ${e.message}")
+                }
+            }
+        }
+
+        /**
+         * 拦截 SplashActivity 中的广告展示方法，跳过开屏广告直接进入主界面。
+         * 由 ClassLoader.loadClass 监听器触发，在 SplashActivity 首次加载时安装。
+         */
+        private fun installSplashAdHooks(classLoader: ClassLoader) {
+            if (splashAdHookInstalled) return
+            splashAdHookInstalled = true
+
+            XposedBridge.log("TankeHook: Installing SplashActivity ad hooks...")
+            try {
+                val splashClass = XposedHelpers.findClass(
+                    "com.lptiyu.tanke.activities.splash.SplashActivity", classLoader
+                )
+
+                try {
+                    val showAdMethod = splashClass.getDeclaredMethod("showAd")
+                    XposedBridge.hookMethod(showAdMethod, object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            vlog("SplashActivity.showAd() skipped")
+                            param.result = null
+                        }
+                    })
+                    XposedBridge.log("TankeHook: Hooked SplashActivity.showAd()")
+                } catch (e: Throwable) {
+                    XposedBridge.log("TankeHook: showAd hook failed: ${e.message}")
+                }
+
+                try {
+                    val fetchAdMethod = splashClass.getDeclaredMethod("fetchAd", String::class.java)
+                    XposedBridge.hookMethod(fetchAdMethod, object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            vlog("SplashActivity.fetchAd() skipped")
+                            param.result = null
+                        }
+                    })
+                    XposedBridge.log("TankeHook: Hooked SplashActivity.fetchAd()")
+                } catch (e: Throwable) {
+                    XposedBridge.log("TankeHook: fetchAd hook failed: ${e.message}")
+                }
+
+                try {
+                    val initSdkMethod = splashClass.getDeclaredMethod("initSdk")
+                    XposedBridge.hookMethod(initSdkMethod, object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            vlog("SplashActivity.initSdk() skipped")
+                            param.result = null
+                        }
+                    })
+                    XposedBridge.log("TankeHook: Hooked SplashActivity.initSdk()")
+                } catch (e: Throwable) {
+                    XposedBridge.log("TankeHook: initSdk hook failed: ${e.message}")
+                }
+            } catch (e: Throwable) {
+                XposedBridge.log("TankeHook: SplashActivity class not available: ${e.message}")
+            }
+        }
+
+        private fun installTrustManagerBypass() {            if (trustManagerHooksInstalled) return
             var installed = false
 
             // Android Conscrypt 常见证书链校验入口
@@ -624,6 +878,7 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
     override fun handleLoadPackage(lpparam: LoadPackageParam) {
         if (lpparam.packageName != "com.lptiyu.tanke") return
         XposedBridge.log("TankeHook: loading for ${lpparam.packageName}")
+        loadPrefs()
         installNetworkCaptureHooks(lpparam.classLoader)
     }
 }
