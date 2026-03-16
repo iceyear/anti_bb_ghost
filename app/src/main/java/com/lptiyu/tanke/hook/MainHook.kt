@@ -479,23 +479,6 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 XposedBridge.log("TankeHook: Builder.certificatePinner hook failed: ${e.message}")
             }
 
-            // 业务自定义 OkHttp 包装层（本样本中出现）
-            try {
-                XposedHelpers.findAndHookMethod(
-                    "p1141g.p1433b.p1438b.p1451d.C16910p\$b",
-                    classLoader,
-                    "m75048y",
-                    XposedHelpers.findClass("okhttp3.CertificatePinner", classLoader),
-                    object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            param.args[0] = null
-                        }
-                    }
-                )
-                XposedBridge.log("TankeHook: Hooked custom builder m75048y(CertificatePinner)")
-            } catch (e: Throwable) {
-                XposedBridge.log("TankeHook: Custom builder pinning hook failed: ${e.message}")
-            }
         }
 
         private fun installTrustManagerBypass() {
