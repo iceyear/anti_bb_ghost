@@ -1,8 +1,11 @@
+#define _GNU_SOURCE 1
+
 #include "register_natives_hook.h"
 
 #include <android/log.h>
+#include <elf.h>
+#include <link.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -19,40 +22,54 @@ static volatile int register_hook_installed = 0;
 static volatile int log_register_natives_enabled = 0;
 static struct JNINativeInterface *thread_local_jni_table = NULL;
 
-static uintptr_t find_module_for_addr(uintptr_t addr, char *module_name, size_t module_len) {
-    FILE *fp = fopen("/proc/self/maps", "r");
-    if (!fp) return 0;
+typedef struct {
+    uintptr_t addr;
+    uintptr_t module_base;
+    char module_name[256];
+} addr_lookup_t;
 
-    uintptr_t base = 0;
-    char line[512];
-    if (module_name && module_len > 0) module_name[0] = '\0';
+static int module_name_contains_gtcore(const char *name) {
+    return name && strstr(name, "libgtcore.so") != NULL;
+}
 
-    while (fgets(line, sizeof(line), fp) != NULL) {
-        unsigned long start = 0, end = 0, file_off = 0, inode = 0;
-        char perms[8] = {0};
-        char dev[16] = {0};
-        char path[256] = {0};
-        int n = sscanf(line, "%lx-%lx %7s %lx %15s %lu %255[^\n]",
-                       &start, &end, perms, &file_off, dev, &inode, path);
-        if (addr < (uintptr_t)start || addr >= (uintptr_t)end) continue;
+static int phdr_find_module_for_addr_cb(struct dl_phdr_info *info, size_t info_size, void *data) {
+    (void)info_size;
+    addr_lookup_t *lookup = (addr_lookup_t *)data;
+    if (!lookup) return 0;
 
-        base = (uintptr_t)start;
-        if (module_name && module_len > 0) {
-            if (n >= 7) {
-                const char *p = path;
-                while (*p == ' ') p++;
-                strncpy(module_name, p, module_len - 1);
-                module_name[module_len - 1] = '\0';
-            } else {
-                strncpy(module_name, "<anonymous>", module_len - 1);
-                module_name[module_len - 1] = '\0';
-            }
-        }
-        break;
+    for (ElfW(Half) i = 0; i < info->dlpi_phnum; ++i) {
+        const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+        if (ph->p_type != PT_LOAD) continue;
+
+        uintptr_t start = (uintptr_t)info->dlpi_addr + (uintptr_t)ph->p_vaddr;
+        uintptr_t end = start + (uintptr_t)ph->p_memsz;
+        if (lookup->addr < start || lookup->addr >= end) continue;
+
+        lookup->module_base = (uintptr_t)info->dlpi_addr;
+        const char *name = (info && info->dlpi_name && *info->dlpi_name) ? info->dlpi_name : "<phdr>";
+        strncpy(lookup->module_name, name, sizeof(lookup->module_name) - 1);
+        lookup->module_name[sizeof(lookup->module_name) - 1] = '\0';
+        return 1;
     }
 
-    fclose(fp);
-    return base;
+    return 0;
+}
+
+static uintptr_t find_module_for_addr(uintptr_t addr, char *module_name, size_t module_len) {
+    addr_lookup_t lookup;
+    memset(&lookup, 0, sizeof(lookup));
+    lookup.addr = addr;
+
+    dl_iterate_phdr(phdr_find_module_for_addr_cb, &lookup);
+    if (!lookup.module_base) return 0;
+
+    if (module_name && module_len > 0) {
+        strncpy(module_name,
+                lookup.module_name[0] ? lookup.module_name : "<phdr>",
+                module_len - 1);
+        module_name[module_len - 1] = '\0';
+    }
+    return lookup.module_base;
 }
 
 static int get_class_name(JNIEnv *env, jclass clazz, char *out, size_t out_len) {
@@ -96,14 +113,6 @@ static int get_class_name(JNIEnv *env, jclass clazz, char *out, size_t out_len) 
     return out[0] != '\0';
 }
 
-static int ends_with(const char *s, const char *suffix) {
-    if (!s || !suffix) return 0;
-    size_t slen = strlen(s);
-    size_t tlen = strlen(suffix);
-    if (slen < tlen) return 0;
-    return strcmp(s + slen - tlen, suffix) == 0;
-}
-
 static jint hooked_register_natives(JNIEnv *env, jclass clazz,
                                     const JNINativeMethod *methods, jint n_methods) {
     if (log_register_natives_enabled && methods && n_methods > 0) {
@@ -131,17 +140,13 @@ static jint hooked_register_natives(JNIEnv *env, jclass clazz,
             const char *msig = methods[i].signature ? methods[i].signature : "<null>";
 
             if (strcmp(mname, "getData") != 0) continue;
-            if (strcmp(class_name, "com.geetest.core.Core") != 0 &&
-                strcmp(class_name, "com.geetest.core.C3326Core") != 0) {
-                continue;
-            }
 
             uintptr_t fn = (uintptr_t)methods[i].fnPtr;
             char module_name[256];
             uintptr_t base = find_module_for_addr(fn, module_name, sizeof(module_name));
             uintptr_t off = base ? (fn - base) : 0;
 
-            if (!ends_with(module_name, "/libgtcore.so") && strcmp(module_name, "libgtcore.so") != 0) {
+            if (!module_name_contains_gtcore(module_name)) {
                 continue;
             }
 

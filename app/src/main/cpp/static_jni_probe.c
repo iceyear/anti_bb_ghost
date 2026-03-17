@@ -1,9 +1,12 @@
+#define _GNU_SOURCE 1
+
 #include "static_jni_probe.h"
 
 #include <android/log.h>
 #include <dlfcn.h>
+#include <elf.h>
+#include <link.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <string.h>
 
 #define TAG "TankeHook-Native"
@@ -13,78 +16,98 @@ static volatile int probe_enabled = 0;
 static volatile int probe_done = 0;
 static volatile int probe_miss_logged = 0;
 
-static int ends_with(const char *s, const char *suffix) {
-    if (!s || !suffix) return 0;
-    size_t slen = strlen(s);
-    size_t tlen = strlen(suffix);
-    if (slen < tlen) return 0;
-    return strcmp(s + slen - tlen, suffix) == 0;
+typedef struct {
+    uintptr_t addr;
+    uintptr_t module_base;
+    char module_name[256];
+} addr_lookup_t;
+
+typedef struct {
+    uintptr_t module_base;
+    char module_name[256];
+} gtcore_module_info_t;
+
+static int module_name_contains_gtcore(const char *name) {
+    return name && strstr(name, "libgtcore.so") != NULL;
 }
 
-static uintptr_t find_module_for_addr(uintptr_t addr, char *module_name, size_t module_len) {
-    FILE *fp = fopen("/proc/self/maps", "r");
-    if (!fp) return 0;
+static int phdr_find_module_for_addr_cb(struct dl_phdr_info *info, size_t info_size, void *data) {
+    (void)info_size;
+    addr_lookup_t *lookup = (addr_lookup_t *)data;
+    if (!lookup) return 0;
 
-    uintptr_t base = 0;
-    char line[512];
-    if (module_name && module_len > 0) module_name[0] = '\0';
+    for (ElfW(Half) i = 0; i < info->dlpi_phnum; ++i) {
+        const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+        if (ph->p_type != PT_LOAD) continue;
 
-    while (fgets(line, sizeof(line), fp) != NULL) {
-        unsigned long start = 0, end = 0, file_off = 0, inode = 0;
-        char perms[8] = {0};
-        char dev[16] = {0};
-        char path[256] = {0};
-        int n = sscanf(line, "%lx-%lx %7s %lx %15s %lu %255[^\n]",
-                       &start, &end, perms, &file_off, dev, &inode, path);
-        if (addr < (uintptr_t)start || addr >= (uintptr_t)end) continue;
+        uintptr_t start = (uintptr_t)info->dlpi_addr + (uintptr_t)ph->p_vaddr;
+        uintptr_t end = start + (uintptr_t)ph->p_memsz;
+        if (lookup->addr < start || lookup->addr >= end) continue;
 
-        base = (uintptr_t)start;
-        if (module_name && module_len > 0) {
-            if (n >= 7) {
-                const char *p = path;
-                while (*p == ' ') p++;
-                strncpy(module_name, p, module_len - 1);
-                module_name[module_len - 1] = '\0';
-            } else {
-                strncpy(module_name, "<anonymous>", module_len - 1);
-                module_name[module_len - 1] = '\0';
-            }
-        }
-        break;
-    }
-
-    fclose(fp);
-    return base;
-}
-
-static int find_gtcore_mapped_path(char *out, size_t out_len) {
-    if (!out || out_len == 0) return 0;
-    out[0] = '\0';
-
-    FILE *fp = fopen("/proc/self/maps", "r");
-    if (!fp) return 0;
-
-    char line[512];
-    while (fgets(line, sizeof(line), fp) != NULL) {
-        if (strstr(line, "libgtcore.so") == NULL) continue;
-
-        unsigned long start = 0, end = 0, file_off = 0, inode = 0;
-        char perms[8] = {0};
-        char dev[16] = {0};
-        char path[256] = {0};
-        int n = sscanf(line, "%lx-%lx %7s %lx %15s %lu %255[^\n]",
-                       &start, &end, perms, &file_off, dev, &inode, path);
-        if (n < 7) continue;
-        const char *p = path;
-        while (*p == ' ') p++;
-        strncpy(out, p, out_len - 1);
-        out[out_len - 1] = '\0';
-        fclose(fp);
+        lookup->module_base = (uintptr_t)info->dlpi_addr;
+        const char *name = (info && info->dlpi_name && *info->dlpi_name) ? info->dlpi_name : "<phdr>";
+        strncpy(lookup->module_name, name, sizeof(lookup->module_name) - 1);
+        lookup->module_name[sizeof(lookup->module_name) - 1] = '\0';
         return 1;
     }
 
-    fclose(fp);
     return 0;
+}
+
+static uintptr_t find_module_for_addr(uintptr_t addr, char *module_name, size_t module_len) {
+    addr_lookup_t lookup;
+    memset(&lookup, 0, sizeof(lookup));
+    lookup.addr = addr;
+
+    dl_iterate_phdr(phdr_find_module_for_addr_cb, &lookup);
+    if (!lookup.module_base) return 0;
+
+    if (module_name && module_len > 0) {
+        strncpy(module_name,
+                lookup.module_name[0] ? lookup.module_name : "<phdr>",
+                module_len - 1);
+        module_name[module_len - 1] = '\0';
+    }
+    return lookup.module_base;
+}
+
+static int phdr_find_gtcore_cb(struct dl_phdr_info *info, size_t info_size, void *data) {
+    (void)info_size;
+    gtcore_module_info_t *out = (gtcore_module_info_t *)data;
+    const char *name = (info && info->dlpi_name) ? info->dlpi_name : NULL;
+    if (!out || !module_name_contains_gtcore(name)) return 0;
+
+    out->module_base = (uintptr_t)info->dlpi_addr;
+    strncpy(out->module_name, (name && *name) ? name : "<phdr>", sizeof(out->module_name) - 1);
+    out->module_name[sizeof(out->module_name) - 1] = '\0';
+    return 1;
+}
+
+static int find_gtcore_loaded_path(char *out, size_t out_len) {
+    if (!out || out_len == 0) return 0;
+    out[0] = '\0';
+
+    gtcore_module_info_t info;
+    memset(&info, 0, sizeof(info));
+    dl_iterate_phdr(phdr_find_gtcore_cb, &info);
+    if (!info.module_name[0]) return 0;
+
+    strncpy(out, info.module_name, out_len - 1);
+    out[out_len - 1] = '\0';
+    return 1;
+}
+
+static int gtcore_visible_to_loader(void) {
+    gtcore_module_info_t info;
+    memset(&info, 0, sizeof(info));
+    dl_iterate_phdr(phdr_find_gtcore_cb, &info);
+    return info.module_name[0] != '\0';
+}
+
+static void close_if_valid_handle(void *handle) {
+    if (handle) {
+        dlclose(handle);
+    }
 }
 
 void static_jni_probe_set_enabled(int enabled) {
@@ -99,17 +122,20 @@ void static_jni_probe_try_log(void) {
     if (!probe_enabled || probe_done) return;
 
     void *handle = dlopen("libgtcore.so", RTLD_NOW | RTLD_NOLOAD);
-    char mapped_path[256];
-    mapped_path[0] = '\0';
+    char loaded_path[256];
+    loaded_path[0] = '\0';
 
-    if (!handle && find_gtcore_mapped_path(mapped_path, sizeof(mapped_path))) {
-        handle = dlopen(mapped_path, RTLD_NOW | RTLD_NOLOAD);
+    if (!handle && find_gtcore_loaded_path(loaded_path, sizeof(loaded_path))) {
+        handle = dlopen(loaded_path, RTLD_NOW | RTLD_NOLOAD);
         if (!handle) {
-            // Fallback: try normal dlopen on mapped path.
-            handle = dlopen(mapped_path, RTLD_NOW);
+            handle = dlopen(loaded_path, RTLD_NOW);
         }
     }
     if (!handle) {
+        if (gtcore_visible_to_loader() && !probe_miss_logged) {
+            LOGI("StaticJNI probe: libgtcore visible via loader but dlopen handle is unavailable");
+            probe_miss_logged = 1;
+        }
         return;
     }
 
@@ -129,7 +155,7 @@ void static_jni_probe_try_log(void) {
         char module_name[256];
         uintptr_t base = find_module_for_addr(fn, module_name, sizeof(module_name));
         if (!base) continue;
-        if (!ends_with(module_name, "/libgtcore.so") && strcmp(module_name, "libgtcore.so") != 0) {
+        if (!module_name_contains_gtcore(module_name)) {
             continue;
         }
 
@@ -147,5 +173,5 @@ void static_jni_probe_try_log(void) {
         probe_miss_logged = 1;
     }
 
-    dlclose(handle);
+    close_if_valid_handle(handle);
 }

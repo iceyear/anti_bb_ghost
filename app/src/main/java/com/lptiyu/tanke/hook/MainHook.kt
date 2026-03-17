@@ -103,6 +103,8 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
         if (name == "com.secneo.apkwrapper.AW") return true
         if (name == "com.secneo.apkwrapper.AP") return true
         if (name.startsWith("com.geetest.core.")) return true
+        if (name.startsWith("com.lptiyu.tanke.activities.school_run.RunHelper")) return true
+        if (name.startsWith("com.lptiyu.tanke.fragments.TrackFragment")) return true
         if (name.startsWith("com.alibaba.sdk.android.oss")) return true
         if (name.startsWith("okhttp3")) return true
         if (name.startsWith("com.yfanads")) return true

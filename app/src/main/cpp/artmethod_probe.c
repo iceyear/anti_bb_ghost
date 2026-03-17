@@ -1,8 +1,11 @@
+#define _GNU_SOURCE 1
+
 #include "artmethod_probe.h"
 
 #include <android/log.h>
+#include <elf.h>
+#include <link.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <string.h>
 
 #define TAG "TankeHook-Native"
@@ -15,48 +18,66 @@ typedef struct {
     char path[256];
 } map_range_t;
 
+typedef struct {
+    map_range_t *ranges;
+    int max_count;
+    int count;
+    uintptr_t module_base;
+    char module_path[256];
+} gtcore_module_scan_t;
+
+static int module_name_contains_gtcore(const char *name) {
+    return name && strstr(name, "libgtcore.so") != NULL;
+}
+
+static int phdr_collect_gtcore_cb(struct dl_phdr_info *info, size_t info_size, void *data) {
+    (void)info_size;
+    gtcore_module_scan_t *scan = (gtcore_module_scan_t *)data;
+    const char *name = (info && info->dlpi_name) ? info->dlpi_name : NULL;
+    if (!scan || !module_name_contains_gtcore(name)) return 0;
+
+    scan->module_base = (uintptr_t)info->dlpi_addr;
+    if (name && *name) {
+        strncpy(scan->module_path, name, sizeof(scan->module_path) - 1);
+        scan->module_path[sizeof(scan->module_path) - 1] = '\0';
+    } else {
+        strncpy(scan->module_path, "<phdr>", sizeof(scan->module_path) - 1);
+        scan->module_path[sizeof(scan->module_path) - 1] = '\0';
+    }
+
+    for (ElfW(Half) i = 0; i < info->dlpi_phnum && scan->count < scan->max_count; ++i) {
+        const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+        if (ph->p_type != PT_LOAD) continue;
+
+        uintptr_t start = (uintptr_t)info->dlpi_addr + (uintptr_t)ph->p_vaddr;
+        uintptr_t end = start + (uintptr_t)ph->p_memsz;
+        if (end <= start) continue;
+
+        scan->ranges[scan->count].start = start;
+        scan->ranges[scan->count].end = end;
+        scan->ranges[scan->count].executable = (ph->p_flags & PF_X) ? 1 : 0;
+        strncpy(scan->ranges[scan->count].path,
+                scan->module_path,
+                sizeof(scan->ranges[scan->count].path) - 1);
+        scan->ranges[scan->count].path[sizeof(scan->ranges[scan->count].path) - 1] = '\0';
+        scan->count++;
+    }
+
+    return 1;
+}
+
 static int collect_gtcore_ranges(map_range_t *out, int max_count, uintptr_t *module_base) {
     if (!out || max_count <= 0) return 0;
     if (module_base) *module_base = 0;
 
-    FILE *fp = fopen("/proc/self/maps", "r");
-    if (!fp) return 0;
+    gtcore_module_scan_t scan;
+    memset(&scan, 0, sizeof(scan));
+    scan.ranges = out;
+    scan.max_count = max_count;
 
-    int count = 0;
-    char line[512];
-    while (fgets(line, sizeof(line), fp) != NULL) {
-        if (strstr(line, "libgtcore.so") == NULL) continue;
-
-        unsigned long start = 0, end = 0, file_off = 0, inode = 0;
-        char perms[8] = {0};
-        char dev[16] = {0};
-        char path[256] = {0};
-        int n = sscanf(line, "%lx-%lx %7s %lx %15s %lu %255[^\n]",
-                       &start, &end, perms, &file_off, dev, &inode, path);
-        if (n < 6) continue;
-
-        if (count < max_count) {
-            out[count].start = (uintptr_t)start;
-            out[count].end = (uintptr_t)end;
-            out[count].executable = (strchr(perms, 'x') != NULL) ? 1 : 0;
-            if (n >= 7) {
-                const char *p = path;
-                while (*p == ' ') p++;
-                strncpy(out[count].path, p, sizeof(out[count].path) - 1);
-                out[count].path[sizeof(out[count].path) - 1] = '\0';
-            } else {
-                out[count].path[0] = '\0';
-            }
-            count++;
-        }
-
-        if (module_base && (*module_base == 0 || (uintptr_t)start < *module_base)) {
-            *module_base = (uintptr_t)start;
-        }
-    }
-
-    fclose(fp);
-    return count;
+    dl_iterate_phdr(phdr_collect_gtcore_cb, &scan);
+    if (module_base) *module_base = scan.module_base;
+    return scan.count;
 }
 
 void artmethod_probe_dump(JNIEnv *env, jobject reflected_method, jstring label) {
