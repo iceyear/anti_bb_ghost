@@ -26,8 +26,10 @@ object HookPrefs {
     const val KEY_BYPASS_ROOT      = "bypass_root_detect"
     const val KEY_BYPASS_DEBUGGER  = "bypass_debugger_detect"
     const val KEY_BYPASS_VAPP      = "bypass_vapp_detect"
+    const val KEY_BYPASS_FRIDA     = "bypass_frida_detect"
     // 调试
     const val KEY_VERBOSE_LOG      = "verbose_log"
+    const val KEY_LOG_REGISTER_NATIVES = "log_register_natives"
 
     // ── 运行时开关（全部默认开启）────────────────────────────────
     @Volatile var bypassSsl      = true
@@ -39,7 +41,9 @@ object HookPrefs {
     @Volatile var bypassRoot     = true
     @Volatile var bypassDebugger = true
     @Volatile var bypassVapp     = true
+    @Volatile var bypassFrida    = false
     @Volatile var verboseLog     = false
+    @Volatile var logRegisterNatives = false
 
     @Suppress("DEPRECATION")
     fun load(modulePackage: String = "com.lptiyu.tanke.hook") {
@@ -56,11 +60,13 @@ object HookPrefs {
             bypassRoot     = xsp.getBoolean(KEY_BYPASS_ROOT,     true)
             bypassDebugger = xsp.getBoolean(KEY_BYPASS_DEBUGGER, true)
             bypassVapp     = xsp.getBoolean(KEY_BYPASS_VAPP,     true)
+            bypassFrida    = xsp.getBoolean(KEY_BYPASS_FRIDA,    false)
             verboseLog     = xsp.getBoolean(KEY_VERBOSE_LOG,     false)
+            logRegisterNatives = xsp.getBoolean(KEY_LOG_REGISTER_NATIVES, false)
             XposedBridge.log(
                 "TankeHook: prefs — ssl=$bypassSsl dns=$disableHttpdns ads=$disableAds " +
                 "splash=$skipSplashAd stack=$fakeStack proxy=$bypassProxy root=$bypassRoot " +
-                "dbg=$bypassDebugger vapp=$bypassVapp verbose=$verboseLog"
+                "dbg=$bypassDebugger vapp=$bypassVapp frida=$bypassFrida verbose=$verboseLog rnLog=$logRegisterNatives"
             )
         } catch (e: Throwable) {
             XposedBridge.log("TankeHook: prefs load failed (using defaults): ${e.message}")

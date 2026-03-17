@@ -22,10 +22,13 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
     /** ClassLoader.loadClass 重入保护，防止 hook 回调中再次触发 hook 安装 */
     private val isInstallingHooks: ThreadLocal<Boolean> = ThreadLocal.withInitial { false }
     private var classLoaderMonitorInstalled = false
+    private val observedClassNames = HashSet<String>()
 
     override fun initZygote(startupParam: IXposedHookZygoteInit.StartupParam) {
-        NativeHelper.install(startupParam.modulePath)
         HookPrefs.load()
+        NativeHelper.install(startupParam.modulePath)
+        NativeHelper.setRegisterNativesLogEnabled(HookPrefs.logRegisterNatives)
+        NativeHelper.setFridaBypassEnabled(HookPrefs.bypassFrida)
         if (HookPrefs.fakeStack) {
             StackTraceHooks.installZygote()
         }
@@ -35,10 +38,17 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
         if (lpparam.packageName != "com.lptiyu.tanke") return
         XposedBridge.log("TankeHook: loading for ${lpparam.packageName}")
         HookPrefs.load()
+        NativeHelper.setRegisterNativesLogEnabled(HookPrefs.logRegisterNatives)
+        NativeHelper.setFridaBypassEnabled(HookPrefs.bypassFrida)
+        if (HookPrefs.logRegisterNatives) {
+            NativeHelper.probeStaticJniGetDataSymbols()
+        }
         val cl = lpparam.classLoader
+        SecNeoHooks.install(cl)
         NetworkHooks.install(cl)
         AdHooks.install(cl)
         DetectionBypassHooks.install(cl)
+        GeetestHooks.install(cl)
         installClassLoaderMonitor()
     }
 
@@ -50,28 +60,57 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
         if (classLoaderMonitorInstalled) return
         classLoaderMonitorInstalled = true
         try {
-            XposedHelpers.findAndHookMethod(
-                ClassLoader::class.java, "loadClass", String::class.java,
-                object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        if (isInstallingHooks.get()) return
-                        val name   = param.args[0] as? String      ?: return
-                        val loader = param.thisObject as? ClassLoader ?: return
-                        val clazz  = param.result  as? Class<*>    ?: return
-                        isInstallingHooks.set(true)
-                        try {
-                            NetworkHooks.onClassLoaded(name, loader, clazz)
-                            AdHooks.onClassLoaded(name, loader, clazz)
-                            DetectionBypassHooks.onClassLoaded(name, loader)
-                        } finally {
-                            isInstallingHooks.set(false)
+            val callback = object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    if (isInstallingHooks.get() == true) return
+                    val name   = param.args[0] as? String         ?: return
+                    if (!isRelevantClassName(name)) return
+                    val loader = param.thisObject as? ClassLoader ?: return
+                    val clazz  = param.result  as? Class<*>       ?: return
+                    synchronized(observedClassNames) {
+                        if (!observedClassNames.add(name)) return
+                    }
+                    isInstallingHooks.set(true)
+                    try {
+                        if (HookPrefs.logRegisterNatives && name.startsWith("com.geetest.core")) {
+                            NativeHelper.probeStaticJniGetDataSymbols()
                         }
+                        NetworkHooks.onClassLoaded(name, loader, clazz)
+                        AdHooks.onClassLoaded(name, loader, clazz)
+                        DetectionBypassHooks.onClassLoaded(name, loader)
+                        GeetestHooks.onClassLoaded(name, clazz)
+                    } finally {
+                        isInstallingHooks.set(false)
                     }
                 }
+            }
+            XposedHelpers.findAndHookMethod(
+                ClassLoader::class.java, "loadClass", String::class.java, callback
+            )
+            XposedHelpers.findAndHookMethod(
+                ClassLoader::class.java, "loadClass", String::class.java,
+                Boolean::class.javaPrimitiveType, callback
             )
             XposedBridge.log("TankeHook: ClassLoader monitor installed")
         } catch (e: Throwable) {
             XposedBridge.log("TankeHook: ClassLoader monitor failed: ${e.message}")
         }
+    }
+
+    private fun isRelevantClassName(name: String): Boolean {
+        if (name == "p1141g.p1147a0.p1158c.utils.p2") return true
+        if (name == "com.secneo.apkwrapper.H") return true
+        if (name == "com.secneo.apkwrapper.AW") return true
+        if (name == "com.secneo.apkwrapper.AP") return true
+        if (name.startsWith("com.geetest.core.")) return true
+        if (name.startsWith("com.alibaba.sdk.android.oss")) return true
+        if (name.startsWith("okhttp3")) return true
+        if (name.startsWith("com.yfanads")) return true
+        if (name.startsWith("com.beizi")) return true
+        if (name.startsWith("com.kwad")) return true
+        if (name.startsWith("com.bytedance.sdk.openadsdk")) return true
+        if (name.startsWith("com.lptiyu.tanke") && name.contains("Splash")) return true
+        if (name.contains("HostnameVerifier")) return true
+        return false
     }
 }

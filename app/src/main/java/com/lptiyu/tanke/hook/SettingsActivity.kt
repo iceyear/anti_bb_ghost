@@ -69,10 +69,14 @@ class SettingsActivity : Activity() {
                 "拦截 Debug.isDebuggerConnected + C16270p2.m72766x()，规避 error_code 4004（调试器）", true),
             PrefEntry(HookPrefs.KEY_BYPASS_VAPP, "屏蔽虚拟环境检测",
                 "拦截 C16270p2.m72733Q / m72767y()，规避 error_code 4005", true),
+            PrefEntry(HookPrefs.KEY_BYPASS_FRIDA, "屏蔽 Frida 检测（实验）",
+                "开启后在 native 层对疑似 Frida 检测触发的 SIGILL 线程做熔断，降低附加时闪退概率", false),
         )),
         Section("调试", listOf(
             PrefEntry(HookPrefs.KEY_VERBOSE_LOG, "详细日志",
                 "在 logcat 中输出每个 Hook 命中记录（调试用）", false),
+            PrefEntry(HookPrefs.KEY_LOG_REGISTER_NATIVES, "打印 RegisterNatives 偏移",
+                "输出 native 方法绑定信息（class/name/signature/module/base/offset），用于定位极验 getData 实际实现", false),
         )),
     )
 

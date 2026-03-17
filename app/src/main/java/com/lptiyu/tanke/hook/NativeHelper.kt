@@ -54,6 +54,66 @@ object NativeHelper {
         }
     }
 
+    fun setRegisterNativesLogEnabled(enabled: Boolean) {
+        if (!loaded) return
+        try {
+            nativeSetRegisterNativesLogEnabled(enabled)
+        } catch (e: Throwable) {
+            XposedBridge.log("TankeHook: Failed to set RegisterNatives log switch: ${e.message}")
+        }
+    }
+
+    fun setFridaBypassEnabled(enabled: Boolean) {
+        if (!loaded) return
+        try {
+            nativeSetFridaBypassEnabled(enabled)
+        } catch (e: Throwable) {
+            XposedBridge.log("TankeHook: Failed to set Frida bypass switch: ${e.message}")
+        }
+    }
+
+    fun tryPatchDexHelperNow() {
+        if (!loaded) return
+        try {
+            nativeTryPatchDexHelperNow()
+        } catch (e: Throwable) {
+            XposedBridge.log("TankeHook: Failed to trigger DexHelper patch: ${e.message}")
+        }
+    }
+
+    fun probeStaticJniGetDataSymbols() {
+        if (!loaded) return
+        try {
+            nativeProbeStaticJniGetDataSymbols()
+        } catch (e: Throwable) {
+            XposedBridge.log("TankeHook: Failed to probe static JNI symbols: ${e.message}")
+        }
+    }
+
+    fun dumpArtMethodEntry(reflectedMethod: java.lang.reflect.Method, label: String) {
+        if (!loaded) return
+        try {
+            nativeDumpArtMethodEntry(reflectedMethod, label)
+        } catch (e: Throwable) {
+            XposedBridge.log("TankeHook: Failed to dump ArtMethod entry: ${e.message}")
+        }
+    }
+
     @JvmStatic
     private external fun nativeInstallHandler()
+
+    @JvmStatic
+    private external fun nativeSetRegisterNativesLogEnabled(enabled: Boolean)
+
+    @JvmStatic
+    private external fun nativeSetFridaBypassEnabled(enabled: Boolean)
+
+    @JvmStatic
+    private external fun nativeTryPatchDexHelperNow()
+
+    @JvmStatic
+    private external fun nativeProbeStaticJniGetDataSymbols()
+
+    @JvmStatic
+    private external fun nativeDumpArtMethodEntry(reflectedMethod: java.lang.reflect.Method, label: String)
 }
